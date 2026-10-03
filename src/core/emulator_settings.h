@@ -314,6 +314,11 @@ struct InputSettings {
     Setting<int> cursor_state{HideCursorState::Idle};      // specific
     Setting<int> cursor_hide_timeout{5};                   // specific
     Setting<int> usb_device_backend{UsbBackendType::Real}; // specific
+    // TCP port for the emulated Dimensions Toypad's loopback listener, which lets an
+    // external companion app place figures instead of the Dimensions Manager dialog.
+    // Defaults on so a companion app can connect without the user editing config.toml
+    // first; set to 0 in config.toml to disable it.
+    Setting<int> dimensions_listener_port{9191}; // specific
     Setting<bool> use_special_pad{false};
     Setting<int> special_pad_class{1};
     Setting<bool> motion_controls_enabled{true}; // specific
@@ -333,6 +338,8 @@ struct InputSettings {
             make_override<InputSettings>("cursor_hide_timeout",
                                          &InputSettings::cursor_hide_timeout),
             make_override<InputSettings>("usb_device_backend", &InputSettings::usb_device_backend),
+            make_override<InputSettings>("dimensions_listener_port",
+                                         &InputSettings::dimensions_listener_port),
             make_override<InputSettings>("motion_controls_enabled",
                                          &InputSettings::motion_controls_enabled),
             make_override<InputSettings>("background_controller_input",
@@ -349,7 +356,8 @@ struct InputSettings {
     }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_timeout,
-                                   usb_device_backend, use_special_pad, special_pad_class,
+                                   usb_device_backend, dimensions_listener_port, use_special_pad,
+                                   special_pad_class,
                                    motion_controls_enabled, use_unified_input_config,
                                    default_controller_id, background_controller_input,
                                    ime_accessibility_enabled, ime_url_mail_short_panel, camera_id,
@@ -739,6 +747,7 @@ public:
     SETTING_FORWARD(m_input, CursorState, cursor_state)
     SETTING_FORWARD(m_input, CursorHideTimeout, cursor_hide_timeout)
     SETTING_FORWARD(m_input, UsbDeviceBackend, usb_device_backend)
+    SETTING_FORWARD(m_input, DimensionsListenerPort, dimensions_listener_port)
     SETTING_FORWARD_BOOL(m_input, MotionControlsEnabled, motion_controls_enabled)
     SETTING_FORWARD_BOOL(m_input, BackgroundControllerInput, background_controller_input)
     SETTING_FORWARD_BOOL(m_input, ImeAccessibilityEnabled, ime_accessibility_enabled)

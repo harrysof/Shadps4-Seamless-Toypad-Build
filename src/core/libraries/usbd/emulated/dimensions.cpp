@@ -2,8 +2,15 @@
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <bit>
+#include <chrono>
+#include <iostream>
 #include <mutex>
+#include <random>
+#include <string>
 #include <thread>
+
+#include "core/emulator_settings.h"
+#include "core/ipc/ipc.h"
 #include "core/libraries/kernel/threads.h"
 #include "core/tls.h"
 #include "dimensions.h"
@@ -24,7 +31,15 @@ static constexpr std::array<u8, 25> PWD_CONSTANT = {
 DimensionsToypad::DimensionsToypad() {}
 
 void DimensionsToypad::LoadFigure(std::string file_name, u8 pad, u8 index) {
-    Common::FS::IOFile file(file_name, Common::FS::FileAccessMode::ReadWrite);
+    // Share read+write, not the IOFile default (ShareReadOnly, which maps to
+    // _SH_DENYWR). The companion app seeds/reads the same .bin while the
+    // emulator already holds it, and loading the same figure onto a second pad
+    // opens the same file again. With the default that second open - or the
+    // app's own write - fails with "permission denied" and the ASSERT below
+    // fires, so allow concurrent access instead.
+    Common::FS::IOFile file(file_name, Common::FS::FileAccessMode::ReadWrite,
+                            Common::FS::FileType::BinaryFile,
+                            Common::FS::FileShareFlag::ShareReadWrite);
     std::array<u8, 0x2D * 0x04> data;
     ASSERT(file.Read(data) == data.size());
     LoadDimensionsFigure(data, std::move(file), pad, index);
@@ -34,19 +49,66 @@ u32 DimensionsToypad::LoadDimensionsFigure(const std::array<u8, 0x2D * 0x04>& bu
                                            Common::FS::IOFile file, u8 pad, u8 index) {
     std::lock_guard lock(m_dimensions_mutex);
 
-    const u32 id = GetFigureId(buf);
+    std::array<u8, 0x2D * 0x04> data = buf;
+
+    // A real physical figure's NFC UID is unique per tag even when several tags represent
+    // the same character. A companion app can only ever send back the one fixed dump it has
+    // for a given character, so loading a second copy of an already-active character sends
+    // an identical UID - which reports the same UID as newly added at a different pad/index
+    // without ever being removed from the first, a state that can't happen with real
+    // hardware. The game can't make sense of that and drops the second figure. If the
+    // incoming UID collides with a figure already occupying another slot, mint it a fresh
+    // random UID and re-key the pages that are encrypted with it (character id, password),
+    // exactly like CreateFigure does when it mints a brand new custom tag.
+    const auto uid_of = [](const std::array<u8, 0x2D * 0x04>& d) -> std::array<u8, 7> {
+        return {d[0], d[1], d[2], d[4], d[5], d[6], d[7]};
+    };
+    bool collides = false;
+    for (u8 i = 0; i < MAX_DIMENSIONS_FIGURES; i++) {
+        const DimensionsFigure& other = m_figures[i];
+        if (i == index || other.pad == 255)
+            continue;
+        if (uid_of(other.data) == uid_of(data)) {
+            collides = true;
+            break;
+        }
+    }
+
+    if (collides) {
+        const u32 fig_num = GetFigureId(data);
+        RandomUID(data.data());
+        // Characters have their model number encrypted in page 36 using a key derived from
+        // the UID; vehicles/gadgets store it as plain little-endian bytes there instead (see
+        // GetFigureId) and don't need re-encrypting.
+        if (fig_num < 1000) {
+            const std::array<u8, 16> figure_key = GenerateFigureKey(data);
+            const std::array<u8, 8> value_to_encrypt = {
+                u8(fig_num & 0xFF),         u8((fig_num >> 8) & 0xFF),
+                u8((fig_num >> 16) & 0xFF), u8((fig_num >> 24) & 0xFF),
+                u8(fig_num & 0xFF),         u8((fig_num >> 8) & 0xFF),
+                u8((fig_num >> 16) & 0xFF), u8((fig_num >> 24) & 0xFF)};
+            const std::array<u8, 8> encrypted = Encrypt(value_to_encrypt.data(), figure_key);
+            std::memcpy(&data[36 * 4], &encrypted[0], 4);
+            std::memcpy(&data[37 * 4], &encrypted[4], 4);
+        }
+        std::memcpy(&data[43 * 4], PWDGenerate(uid_of(data)).data(), 4);
+    }
+
+    const u32 id = GetFigureId(data);
 
     DimensionsFigure& figure = GetFigureByIndex(index);
     figure.dimFile = std::move(file);
     figure.id = id;
     figure.pad = pad;
     figure.index = index + 1;
-    figure.data = buf;
+    figure.data = data;
+    if (collides)
+        figure.Save(); // persist the freshly minted UID/keys to the staged .bin file
     // When a figure is added to the toypad, respond to the game with the pad they were added to,
     // their index, the direction (0x00 in byte 6 for added) and their UID
-    std::array<u8, 32> figureChangeResponse = {0x56,   0x0b,   figure.pad, 0x00,   figure.index,
-                                               0x00,   buf[0], buf[1],     buf[2], buf[4],
-                                               buf[5], buf[6], buf[7]};
+    std::array<u8, 32> figureChangeResponse = {0x56,    0x0b,    figure.pad, 0x00,    figure.index,
+                                               0x00,    data[0], data[1],    data[2], data[4],
+                                               data[5], data[6], data[7]};
     figureChangeResponse[13] = GenerateChecksum(figureChangeResponse, 13);
     m_figure_added_removed_responses.push(figureChangeResponse);
 
@@ -84,6 +146,11 @@ void DimensionsToypad::MoveFigure(u8 new_pad, u8 new_index, u8 old_pad, u8 old_i
         CancelRemoveFigure(new_index);
         return;
     }
+
+    // A MOVE from an empty slot is a no-op: bail before touching the destination
+    // so it can't be cleared and then filled with a blank placeholder figure.
+    if (GetFigureByIndex(old_index).index == 255)
+        return;
 
     // When moving figures between spaces on the toypad, remove any figure from the space they are
     // moving to, then remove them from their current space, then load them to the space they are
@@ -491,6 +558,219 @@ std::optional<std::array<u8, 32>> DimensionsToypad::PopAddedRemovedResponse() {
     return response;
 }
 
+namespace {
+// Region index (center/left/right) for a wire pad value: 1=center, 2=left, 3=right.
+u8 LedPadIndex(u8 pad) {
+    switch (pad) {
+    case 1: return 0; // center
+    case 2: return 1; // left
+    case 3: return 2; // right
+    }
+    return 0;
+}
+// Wire pad value for a region index (the "All" commands enumerate center, left, right).
+u8 LedRegionPad(u8 region) {
+    static constexpr std::array<u8, 3> pads = {1, 2, 3};
+    return pads[region];
+}
+// Independent of the NFC challenge/response RNG (m_random_a..d) so LED
+// fade-random colours never perturb that sequence.
+u8 NextLedRandomByte() {
+    static std::mutex rng_mutex;
+    static std::mt19937 rng{std::random_device{}()};
+    std::lock_guard lock(rng_mutex);
+    return static_cast<u8>(rng() & 0xFF);
+}
+} // namespace
+
+std::array<DimensionsToypad::led_state, 3> DimensionsToypad::GetLedStates() {
+    std::lock_guard lock(m_led_mutex);
+    return m_led_state;
+}
+
+u8 DimensionsToypad::GetLedSerial() {
+    std::lock_guard lock(m_led_mutex);
+    return m_led_serial;
+}
+
+void DimensionsToypad::SetLedState(u8 pad, u8 mode, u8 r, u8 g, u8 b, u8 on_ms, u8 off_ms,
+                                   u8 count, u8 speed_ms) {
+    std::lock_guard lock(m_led_mutex);
+    const u8 serial_before = m_led_serial;
+    auto apply = [&](u8 target_pad) {
+            led_state& state = m_led_state[LedPadIndex(target_pad)];
+        // A fade's "from" colour is whatever the pad was already showing (or
+        // already fading towards) the moment this command lands, so a fade
+        // issued mid-fade still anchors to something on-screen.
+        const u8 from_r = state.r, from_g = state.g, from_b = state.b;
+        if (state.mode == mode && state.r == r && state.g == g && state.b == b &&
+            state.on_ms == on_ms && state.off_ms == off_ms && state.count == count &&
+            state.speed_ms == speed_ms) {
+            return; // unchanged - leave the serial alone so pollers can skip it
+        }
+        state.pad = target_pad;
+        state.mode = mode;
+        state.r = r;
+        state.g = g;
+        state.b = b;
+        if (mode == 3) { // Fade: remember the pre-command colour to cross-fade from
+            state.from_r = from_r;
+            state.from_g = from_g;
+            state.from_b = from_b;
+        }
+        state.on_ms = on_ms;
+        state.off_ms = off_ms;
+        state.count = count;
+        state.speed_ms = speed_ms;
+        ++m_led_serial;
+    };
+    if (pad == 0) { // all pads
+        apply(1);
+        apply(2);
+        apply(3);
+    } else {
+        apply(pad);
+    }
+    if (m_led_serial != serial_before) {
+        PushLedStateIpc();
+    }
+}
+
+// Mirrors the current LED snapshot out over the stdin/stderr IPC channel (the
+// same one the seamless bridge already drives figure commands through), for a
+// companion app that isn't connected to DimensionsListener directly. Matches
+// DimensionsListener's wire layout field-for-field so both paths agree.
+// Called with m_led_mutex already held.
+void DimensionsToypad::PushLedStateIpc() {
+    if (!IPC::Instance().IsEnabled()) {
+        return;
+    }
+    std::string line = ";LED_STATE ";
+    line += std::to_string(m_led_serial);
+    for (const auto& state : m_led_state) {
+        line += ' ';
+        line += std::to_string(state.pad);
+        line += ' ';
+        line += std::to_string(state.mode);
+        line += ' ';
+        line += std::to_string(state.r);
+        line += ' ';
+        line += std::to_string(state.g);
+        line += ' ';
+        line += std::to_string(state.b);
+        line += ' ';
+        line += std::to_string(state.from_r);
+        line += ' ';
+        line += std::to_string(state.from_g);
+        line += ' ';
+        line += std::to_string(state.from_b);
+        line += ' ';
+        line += std::to_string(state.on_ms);
+        line += ' ';
+        line += std::to_string(state.off_ms);
+        line += ' ';
+        line += std::to_string(state.count);
+        line += ' ';
+        line += std::to_string(state.speed_ms);
+    }
+    line += '\n';
+    std::cerr << line;
+    std::cerr.flush();
+}
+
+// Parses the game's HID LED commands (0xC0..0xC8) and mirrors the per-region
+// state. Same byte layout as the Cemu/RPCS3 forks (shared reverse-engineering):
+// header {0x55, len, command, messageId, ...}, args from buf[4]; "All" commands
+// enumerate center, left, right, each with a leading on/off byte.
+void DimensionsToypad::HandleLedCommand(const u8* buf, u32 buf_size) {
+    if (buf_size < 25) {
+        return;
+    }
+    const u8 command = buf[2];
+    switch (command) {
+    case 0xC0: // Color: pad, r, g, b
+        SetLedState(buf[4], 1, buf[5], buf[6], buf[7], 0, 0, 0, 0);
+        break;
+    case 0xC1: // Get Pad Color - query only, no state change
+        break;
+    case 0xC2: // Fade: pad, tickTime, tickCount, r, g, b
+        SetLedState(buf[4], 3, buf[7], buf[8], buf[9], 0, 0, buf[6], buf[5]);
+        break;
+    case 0xC3: // Flash: pad, on, off, count(0xFF=forever), r, g, b
+    {
+        const u8 count = (buf[7] == 0xFF) ? 0 : buf[7];
+        SetLedState(buf[4], 2, buf[8], buf[9], buf[10], buf[5], buf[6], count, 0);
+        break;
+    }
+    case 0xC4: // Fade Random: pad, tickTime, tickCount
+    {
+        // The real portal's firmware picks its own random target per pad, so
+        // pad 0 (all pads) is expanded here rather than letting SetLedState
+        // broadcast one shared colour to all three.
+        if (buf[4] == 0) {
+            for (u8 target_pad = 1; target_pad <= 3; ++target_pad) {
+                SetLedState(target_pad, 3, NextLedRandomByte(), NextLedRandomByte(),
+                           NextLedRandomByte(), 0, 0, buf[6], buf[5]);
+            }
+        } else {
+            SetLedState(buf[4], 3, NextLedRandomByte(), NextLedRandomByte(), NextLedRandomByte(),
+                       0, 0, buf[6], buf[5]);
+        }
+        break;
+    }
+    case 0xC6: // Fade All: per-region on/off, tickTime, tickCount, r, g, b
+        for (u8 region = 0; region < 3; ++region) {
+            const u32 off = 4 + region * 6;
+            if (buf[off] == 0) {
+                SetLedState(LedRegionPad(region), 0, 0, 0, 0, 0, 0, 0, 0);
+                continue;
+            }
+            SetLedState(LedRegionPad(region), 3, buf[off + 3], buf[off + 4], buf[off + 5], 0, 0,
+                        buf[off + 2], buf[off + 1]);
+        }
+        break;
+    case 0xC7: // Flash All: per-region on/off, on, off, count, r, g, b
+        for (u8 region = 0; region < 3; ++region) {
+            const u32 off = 4 + region * 7;
+            if (buf[off] == 0) {
+                SetLedState(LedRegionPad(region), 0, 0, 0, 0, 0, 0, 0, 0);
+                continue;
+            }
+            const u8 count = (buf[off + 3] == 0xFF) ? 0 : buf[off + 3];
+            SetLedState(LedRegionPad(region), 2, buf[off + 4], buf[off + 5], buf[off + 6],
+                        buf[off + 1], buf[off + 2], count, 0);
+        }
+        break;
+    case 0xC8: // Color All: per-region on/off, r, g, b
+        for (u8 region = 0; region < 3; ++region) {
+            const u32 off = 4 + region * 4;
+            if (buf[off] == 0) {
+                SetLedState(LedRegionPad(region), 0, 0, 0, 0, 0, 0, 0, 0);
+                continue;
+            }
+            SetLedState(LedRegionPad(region), 1, buf[off + 1], buf[off + 2], buf[off + 3], 0, 0, 0,
+                        0);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+DimensionsBackend::DimensionsBackend() {
+    m_listener = std::make_unique<DimensionsListener>(m_dimensions_toypad);
+    // Nothing exposes this setting in any UI, so a stored 0 can only be a leftover
+    // from before this port had a real default (e.g. a per-game config saved back
+    // when it was 0) rather than a deliberate choice to disable the listener.
+    u16 port = static_cast<u16>(EmulatorSettings.GetDimensionsListenerPort());
+    if (port == 0) {
+        port = 9191;
+    }
+    m_listener->Start(port);
+}
+
+DimensionsBackend::~DimensionsBackend() = default;
+
 libusb_endpoint_descriptor* DimensionsBackend::FillEndpointDescriptorPair() {
     return m_endpoint_descriptors.data();
 }
@@ -516,10 +796,11 @@ libusb_transfer_status DimensionsBackend::HandleAsyncTransfer(libusb_transfer* t
     switch (transfer->endpoint) {
     case 0x81: {
         // Read Endpoint, wait to respond with either an added/removed figure response, or a queued
-        // response from a previous write
+        // response from a previous write. The guest polls this endpoint from a dedicated thread,
+        // so block until something is available rather than spinning on the mutex.
         bool responded = false;
+        std::unique_lock lock(m_query_mutex);
         while (!responded) {
-            std::lock_guard lock(m_query_mutex);
             std::optional<std::array<u8, 32>> response =
                 m_dimensions_toypad->PopAddedRemovedResponse();
             if (response) {
@@ -531,6 +812,11 @@ libusb_transfer_status DimensionsBackend::HandleAsyncTransfer(libusb_transfer* t
                 transfer->length = 32;
                 m_queries.pop();
                 responded = true;
+            } else {
+                // A queued reply wakes us immediately; the timeout bounds how long a figure
+                // added/removed response can sit before it is noticed, since those are pushed
+                // under the toypad's mutex. It matches the endpoint's 1ms poll interval.
+                m_query_cv.wait_for(lock, std::chrono::milliseconds(1));
             }
         }
         break;
@@ -573,6 +859,9 @@ libusb_transfer_status DimensionsBackend::HandleAsyncTransfer(libusb_transfer* t
         case 0xC7: // Flash All
         case 0xC8: // Color All
         {
+            // Mirror the pad-region LED state out over the IPC channel so a
+            // companion app can render the pads glowing like a real toypad.
+            m_dimensions_toypad->HandleLedCommand(transfer->buffer, static_cast<u32>(transfer->length));
             // Send a blank response to acknowledge color has been sent to toypad
             m_dimensions_toypad->GetBlankResponse(0x01, sequence, q_result);
             break;
@@ -611,8 +900,11 @@ libusb_transfer_status DimensionsBackend::HandleAsyncTransfer(libusb_transfer* t
             break;
         }
         }
-        std::lock_guard lock(m_query_mutex);
-        m_queries.push(q_result);
+        {
+            std::lock_guard lock(m_query_mutex);
+            m_queries.push(q_result);
+        }
+        m_query_cv.notify_one();
         break;
     }
     default:
