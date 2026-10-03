@@ -86,8 +86,7 @@ protected:
     std::array<DimensionsFigure, MAX_DIMENSIONS_FIGURES> m_figures{};
 
 private:
-    void SetLedState(u8 pad, u8 mode, u8 r, u8 g, u8 b, u8 on_ms, u8 off_ms, u8 count,
-                     u8 speed_ms);
+    void SetLedState(u8 pad, u8 mode, u8 r, u8 g, u8 b, u8 on_ms, u8 off_ms, u8 count, u8 speed_ms);
     // Pushes ";LED_STATE <serial> <36 ints>" on stderr for IPC clients (e.g. the
     // seamless bridge) that don't connect to DimensionsListener directly. No-op
     // when IPC is disabled. Called with m_led_mutex already held.

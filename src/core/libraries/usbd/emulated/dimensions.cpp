@@ -83,9 +83,8 @@ u32 DimensionsToypad::LoadDimensionsFigure(const std::array<u8, 0x2D * 0x04>& bu
         if (fig_num < 1000) {
             const std::array<u8, 16> figure_key = GenerateFigureKey(data);
             const std::array<u8, 8> value_to_encrypt = {
-                u8(fig_num & 0xFF),         u8((fig_num >> 8) & 0xFF),
-                u8((fig_num >> 16) & 0xFF), u8((fig_num >> 24) & 0xFF),
-                u8(fig_num & 0xFF),         u8((fig_num >> 8) & 0xFF),
+                u8(fig_num & 0xFF),         u8((fig_num >> 8) & 0xFF), u8((fig_num >> 16) & 0xFF),
+                u8((fig_num >> 24) & 0xFF), u8(fig_num & 0xFF),        u8((fig_num >> 8) & 0xFF),
                 u8((fig_num >> 16) & 0xFF), u8((fig_num >> 24) & 0xFF)};
             const std::array<u8, 8> encrypted = Encrypt(value_to_encrypt.data(), figure_key);
             std::memcpy(&data[36 * 4], &encrypted[0], 4);
@@ -562,9 +561,12 @@ namespace {
 // Region index (center/left/right) for a wire pad value: 1=center, 2=left, 3=right.
 u8 LedPadIndex(u8 pad) {
     switch (pad) {
-    case 1: return 0; // center
-    case 2: return 1; // left
-    case 3: return 2; // right
+    case 1:
+        return 0; // center
+    case 2:
+        return 1; // left
+    case 3:
+        return 2; // right
     }
     return 0;
 }
@@ -593,12 +595,12 @@ u8 DimensionsToypad::GetLedSerial() {
     return m_led_serial;
 }
 
-void DimensionsToypad::SetLedState(u8 pad, u8 mode, u8 r, u8 g, u8 b, u8 on_ms, u8 off_ms,
-                                   u8 count, u8 speed_ms) {
+void DimensionsToypad::SetLedState(u8 pad, u8 mode, u8 r, u8 g, u8 b, u8 on_ms, u8 off_ms, u8 count,
+                                   u8 speed_ms) {
     std::lock_guard lock(m_led_mutex);
     const u8 serial_before = m_led_serial;
     auto apply = [&](u8 target_pad) {
-            led_state& state = m_led_state[LedPadIndex(target_pad)];
+        led_state& state = m_led_state[LedPadIndex(target_pad)];
         // A fade's "from" colour is whatever the pad was already showing (or
         // already fading towards) the moment this command lands, so a fade
         // issued mid-fade still anchors to something on-screen.
@@ -710,11 +712,11 @@ void DimensionsToypad::HandleLedCommand(const u8* buf, u32 buf_size) {
         if (buf[4] == 0) {
             for (u8 target_pad = 1; target_pad <= 3; ++target_pad) {
                 SetLedState(target_pad, 3, NextLedRandomByte(), NextLedRandomByte(),
-                           NextLedRandomByte(), 0, 0, buf[6], buf[5]);
+                            NextLedRandomByte(), 0, 0, buf[6], buf[5]);
             }
         } else {
-            SetLedState(buf[4], 3, NextLedRandomByte(), NextLedRandomByte(), NextLedRandomByte(),
-                       0, 0, buf[6], buf[5]);
+            SetLedState(buf[4], 3, NextLedRandomByte(), NextLedRandomByte(), NextLedRandomByte(), 0,
+                        0, buf[6], buf[5]);
         }
         break;
     }
@@ -861,7 +863,8 @@ libusb_transfer_status DimensionsBackend::HandleAsyncTransfer(libusb_transfer* t
         {
             // Mirror the pad-region LED state out over the IPC channel so a
             // companion app can render the pads glowing like a real toypad.
-            m_dimensions_toypad->HandleLedCommand(transfer->buffer, static_cast<u32>(transfer->length));
+            m_dimensions_toypad->HandleLedCommand(transfer->buffer,
+                                                  static_cast<u32>(transfer->length));
             // Send a blank response to acknowledge color has been sent to toypad
             m_dimensions_toypad->GetBlankResponse(0x01, sequence, q_result);
             break;
