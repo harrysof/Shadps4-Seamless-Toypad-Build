@@ -154,8 +154,9 @@ void DimensionsListener::Run(u16 port) {
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_port = ::htons(port);
-    address.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+    // htons/htonl are macros on Darwin, so they cannot take a '::' qualifier.
+    address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (::bind(server, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
         ::listen(server, 1) != 0) {
